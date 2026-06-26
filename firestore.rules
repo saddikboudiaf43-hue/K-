@@ -1,0 +1,133 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // دالة مساعدة للتحقق مما إذا كان المستخدم مسجلاً دخوله
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // دالة مساعدة للتحقق من هوية صاحب المستند
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    // دالة مساعدة لجلب بيانات المستخدم الحالي من قاعدة البيانات
+    function getUserData() {
+      return get(/databases/$(database)/documents/Users/$(request.auth.uid)).data;
+    }
+
+    // دالة مساعدة للتحقق مما إذا كان المستخدم يملك دور الأدمن الأعلى (SUPER_ADMIN أو admin)
+    function isSuperAdmin() {
+      return isAuthenticated() && 
+        (getUserData().role == 'SUPER_ADMIN' || getUserData().role == 'admin' || request.auth.token.role == 'SUPER_ADMIN' || request.auth.token.role == 'admin');
+    }
+
+    // دالة مساعدة للتحقق مما إذا كان المستخدم يملك دور المشرف أو الأدمن (MODERATOR / supervisor / admin)
+    function isModerator() {
+      return isAuthenticated() && 
+        (getUserData().role == 'MODERATOR' || getUserData().role == 'supervisor' || getUserData().role == 'SUPER_ADMIN' || getUserData().role == 'admin' || request.auth.token.role == 'MODERATOR' || request.auth.token.role == 'supervisor');
+    }
+
+    // ==========================================
+    // 1. قواعد مجموعة Users (المستخدمين)
+    // ==========================================
+    match /Users/{userId} {
+      // يسمح بالقراءة لجميع المستخدمين المسجلين لعرض الملفات الشخصية والأسماء على الحائط
+      allow read: if isAuthenticated();
+      
+      // يسمح بإنشاء الحساب الجديد لأي مستخدم مسجل بشرط تطابق المعرف وتعيين الدور الافتراضي كمستخدم عادي
+      allow create: if isAuthenticated() && isOwner(userId) && 
+        (request.resource.data.role in ['USER', 'user']) && 
+        request.resource.data.isActive == true;
+
+      // يسمح للمستخدم بتحديث بياناته الشخصية بشرط عدم تعديل دوره (لمنع الترقية الذاتية)
+      allow update: if isOwner(userId) && 
+        (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['role', 'createdAt']))
+        || isSuperAdmin();
+
+      // الحذف مقتصر فقط على الأدمن الأعلى (admin)
+      allow delete: if isSuperAdmin();
+    }
+
+    // ==========================================
+    // 2. قواعد مجموعة Posts (المنشورات للحائط)
+    // ==========================================
+    match /Posts/{postId} {
+      // يسمح للمستخدمين المسجلين بقراءة المنشورات المقبولة والنشطة
+      allow read: if isAuthenticated();
+
+      // يسمح لأي مستخدم مسجل بإنشاء منشور، ويجب أن يكون هو الكاتب الفعلي ومطابقة الـ authorId وتواجد الحقول المطلوبة
+      allow create: if isAuthenticated() && 
+        request.resource.data.authorId == request.auth.uid &&
+        request.resource.data.content != null &&
+        request.resource.data.timestamp != null;
+
+      // يسمح لصاحب المنشور بتعديل منشوره (محتوى، عنوان)، ويمنع تعديل محتوى الآخرين لغير الأدمن/المشرفين
+      allow update: if isAuthenticated() && (
+        isOwner(resource.data.authorId) && !request.resource.data.diff(resource.data).affectedKeys().hasAny(['authorId', 'createdAt', 'role'])
+        || isModerator()
+        || (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['likesCount', 'commentsCount']))
+      );
+
+      // يسمح بحذف المنشور لصاحب المنشور، أو للمشرفين والأدمن (يمنع حذف منشورات الآخرين لغير المشرف والأدمن)
+      allow delete: if isAuthenticated() && (isOwner(resource.data.authorId) || isModerator());
+
+      // --- المجموعة الفرعية: التعليقات داخل المنشور ---
+      match /Comments/{commentId} {
+        allow read: if isAuthenticated();
+        
+        allow create: if isAuthenticated() && 
+          request.resource.data.authorId == request.auth.uid;
+
+        // يسمح بالتعديل لصاحب التعليق فقط (يمنع تعديل تعليقات الآخرين لغير الأدمن)
+        allow update: if isAuthenticated() && (isOwner(resource.data.authorId) || isModerator()) &&
+          !request.resource.data.diff(resource.data).affectedKeys().hasAny(['authorId', 'createdAt']);
+
+        // يسمح بالحذف لصاحب التعليق، أو صاحب المنشور الأصلي، أو المشرفين والأدمن
+        allow delete: if isAuthenticated() && (
+          isOwner(resource.data.authorId) 
+          || isOwner(get(/databases/$(database)/documents/Posts/{postId}).data.authorId)
+          || isModerator()
+        );
+      }
+    }
+
+    // ==========================================
+    // 3. قواعد مجموعة Reports (البلاغات والشكاوى)
+    // ==========================================
+    match /Reports/{reportId} {
+      // لا يسمح بقراءة البلاغات إلا للمشرفين والأدمن لضمان الخصوصية والسرية الكاملة
+      allow read: if isModerator();
+
+      // يسمح لأي مستخدم مسجل بإرسال بلاغ عن منشور أو مستخدم مخالف مع الحقول reporterId, targetId, reason
+      allow create: if isAuthenticated() && 
+        request.resource.data.reporterId == request.auth.uid &&
+        request.resource.data.targetId != null &&
+        request.resource.data.reason != null;
+
+      // يسمح فقط للمشرفين والأدمن بتحديث حالة البلاغ
+      allow update: if isModerator();
+
+      // لا يسمح بالحذف إطلاقاً للحفاظ على سجلات الرقابة، أو يقتصر على الأدمن الأعلى فقط
+      allow delete: if isSuperAdmin();
+    }
+
+    // ==========================================
+    // 4. قواعد مجموعة Content (المصحف الشريف ومكتبة الفقه)
+    // ==========================================
+    match /Content/{contentDocId} {
+      // المحتوى متاح للقراءة العامة للجميع (حتى لغير المسجلين لدعم انتشار العلم الشرعي)
+      allow read: if true;
+
+      // تعديل، إضافة، أو حذف المحتوى مقتصر تماماً على الأدمن الأعلى لضمان موثوقية النصوص الشرعية ومنع العبث بها
+      allow write: if isSuperAdmin();
+
+      // --- المجموعات الفرعية: الأبواب، الفصول، أو السور والآيات ---
+      match /{allSubcollections=**} {
+        allow read: if true;
+        allow write: if isSuperAdmin();
+      }
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "K™",
+  "description": "تطبيق مسجد عثمان بن عفان - القدادرة: منصة دعوية واجتماعية وتطوعية متكاملة لأهالي القرية.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
